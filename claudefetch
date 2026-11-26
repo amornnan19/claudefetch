@@ -1,0 +1,622 @@
+#!/usr/bin/env python3
+"""claudefetch - a fastfetch-style summary of your local Claude setup."""
+
+import argparse
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+VERSION = "0.1.0"
+
+# Catppuccin Frappe
+PALETTE = {
+    "rosewater": "f2d5cf", "flamingo": "eebebe", "pink": "f4b8e4",
+    "mauve": "ca9ee6", "red": "e78284", "maroon": "ea999c",
+    "peach": "ef9f76", "yellow": "e5c890", "green": "a6d189",
+    "teal": "81c8be", "sky": "99d1db", "sapphire": "85c1dc",
+    "blue": "8caaee", "lavender": "babbf1", "text": "c6d0f5",
+    "subtext0": "a5adce", "overlay1": "838ba7", "overlay0": "737994",
+    "surface2": "626880",
+}
+
+RAINBOW_STOPS = ["red", "peach", "yellow", "green", "teal", "sky",
+                 "sapphire", "blue", "lavender", "mauve", "pink", "red"]
+
+# Pixel mascot: 14x8 grid, each pixel drawn two cells wide.
+LOGO = [
+    "    ████████████████████    ",
+    "    ████  ████████  ████    ",
+    "    ████  ████████  ████    ",
+    "████████████████████████████",
+    "████████████████████████████",
+    "    ████████████████████    ",
+    "    ██  ██        ██  ██    ",
+    "    ██  ██        ██  ██    ",
+]
+LOGO_STOPS = ["peach", "red", "pink"]  # vertical gradient, top to bottom
+
+BLOCK_ROWS = [
+    ["red", "peach", "yellow", "green", "teal", "sky", "blue", "mauve"],
+    ["rosewater", "flamingo", "pink", "maroon", "sapphire", "lavender",
+     "subtext0", "surface2"],
+]
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+EMAIL_RE = re.compile(r"[^\s@'\"<>]+@[^\s@'\"<>]+\.[A-Za-z]{2,}")
+UUID_RE = re.compile(
+    r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b")
+
+
+# ---------------------------------------------------------------- colour
+
+def rgb(name):
+    h = PALETTE[name]
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+def fg(name):
+    r, g, b = rgb(name)
+    return "\033[38;2;%d;%d;%dm" % (r, g, b)
+
+
+RESET = "\033[0m"
+BOLD = "\033[1m"
+
+
+def paint(text, name, bold=False):
+    if not text:
+        return text
+    return (BOLD if bold else "") + fg(name) + text + RESET
+
+
+def visible_len(s):
+    return len(ANSI_RE.sub("", s))
+
+
+def rainbow(text, phase):
+    """Colour each character along the Frappe rainbow loop, RGB-interpolated."""
+    stops = [rgb(n) for n in RAINBOW_STOPS]
+    segs = len(stops) - 1
+    out = []
+    for i, ch in enumerate(text):
+        pos = ((i * 0.15 + phase) % 1.0) * segs
+        k = min(int(pos), segs - 1)
+        t = pos - k
+        a, b = stops[k], stops[k + 1]
+        c = [int(round(a[j] + (b[j] - a[j]) * t)) for j in range(3)]
+        out.append("\033[38;2;%d;%d;%dm%s" % (c[0], c[1], c[2], ch))
+    return "".join(out) + RESET
+
+
+def logo_fg(i, n):
+    """Truecolor escape for logo line i of n, along LOGO_STOPS."""
+    stops = [rgb(c) for c in LOGO_STOPS]
+    pos = (i / max(n - 1, 1)) * (len(stops) - 1)
+    k = min(int(pos), len(stops) - 2)
+    t = pos - k
+    a, b = stops[k], stops[k + 1]
+    return "\033[38;2;%d;%d;%dm" % tuple(int(round(a[j] + (b[j] - a[j]) * t)) for j in range(3))
+
+
+# ------------------------------------------------------------ formatting
+
+def model_name(model):
+    m = str(model)
+    one_m = False
+    if m.lower().endswith("[1m]"):
+        one_m = True
+        m = m[:-4]
+    match = re.match(r"^claude-([a-z]+)-(\d+)(?:-(\d{1,2})(?!\d))?", m)
+    if not match:
+        return str(model)
+    name = match.group(1).capitalize() + " " + match.group(2)
+    if match.group(3):
+        name += "." + match.group(3)
+    return name + (" (1M)" if one_m else "")
+
+
+def tier_name(tier):
+    if not tier:
+        return None
+    m = re.match(r"^default_claude_(max)_(\d+x)$", tier)
+    if m:
+        return "Max " + m.group(2)
+    if tier == "default_claude_pro":
+        return "Pro"
+    return tier
+
+
+def duration(seconds):
+    s = max(0, int(seconds))
+    d, rem = divmod(s, 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    if d:
+        return "%dd %dh" % (d, h)
+    if h:
+        return "%dh %02dm" % (h, m)
+    return "%dm" % m
+
+
+def gauge_color(pct):
+    shown = int(math.floor(pct + 0.5))
+    if shown >= 100:
+        return "red"
+    if shown >= 80:
+        return "peach"
+    if shown >= 50:
+        return "yellow"
+    return "overlay1"
+
+
+def gauge(pct, width=10):
+    filled = int(math.floor(min(max(pct, 0), 100) / 100 * width + 0.5))
+    return "━" * filled + "─" * (width - filled)
+
+
+def ago(ms, now=None):
+    now = time.time() if now is None else now
+    secs = max(0, now - ms / 1000.0)
+    if secs < 60:
+        return "cached just now"
+    if secs < 3600:
+        return "cached %dm ago" % (secs // 60)
+    if secs < 86400:
+        return "cached %dh ago" % (secs // 3600)
+    return "cached %dd ago" % (secs // 86400)
+
+
+def parse_time(s):
+    if not isinstance(s, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def date_with_age(s, now):
+    dt = parse_time(s)
+    if dt is None:
+        return None
+    months = (now.year - dt.year) * 12 + (now.month - dt.month)
+    if now.day < dt.day:
+        months -= 1
+    months = max(0, months)
+    years, mo = divmod(months, 12)
+    age = "%dy %dmo" % (years, mo) if years else "%dmo" % mo
+    return "%s (%s)" % (dt.strftime("%Y-%m-%d"), age)
+
+
+# ----------------------------------------------------------- data access
+
+def read_json(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def count_glob(base, pattern):
+    try:
+        if not base.is_dir():
+            return None
+        return sum(1 for _ in base.glob(pattern))
+    except OSError:
+        return None
+
+
+def pick_creds(blob):
+    """Keep only subscriptionType and rateLimitTier; discard everything else."""
+    try:
+        oauth = json.loads(blob).get("claudeAiOauth")
+    except (ValueError, AttributeError):
+        return {}
+    if not isinstance(oauth, dict):
+        return {}
+    out = {}
+    for key in ("subscriptionType", "rateLimitTier"):
+        if isinstance(oauth.get(key), str):
+            out[key] = oauth[key]
+    return out
+
+
+def read_credentials(claude_dir):
+    creds = {}
+    if sys.platform == "darwin" and os.environ.get("CLAUDEFETCH_NO_KEYCHAIN") != "1":
+        try:
+            res = subprocess.run(
+                ["security", "find-generic-password", "-s",
+                 "Claude Code-credentials", "-w"],
+                capture_output=True, text=True, timeout=2)
+            if res.returncode == 0:
+                creds = pick_creds(res.stdout)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    if not creds:
+        try:
+            creds = pick_creds((claude_dir / ".credentials.json").read_text(encoding="utf-8"))
+        except OSError:
+            pass
+    return creds
+
+
+def claude_version():
+    if os.environ.get("CLAUDEFETCH_NO_SUBPROCESS") == "1":
+        return None
+    try:
+        res = subprocess.run(["claude", "--version"], capture_output=True,
+                             text=True, timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if res.returncode != 0:
+        return None
+    parts = res.stdout.split()
+    return parts[0] if parts else None
+
+
+def hook_count(hooks):
+    if not isinstance(hooks, dict):
+        return None
+    total = 0
+    for groups in hooks.values():
+        if not isinstance(groups, list):
+            continue
+        for g in groups:
+            if isinstance(g, dict) and isinstance(g.get("hooks"), list):
+                total += len(g["hooks"])
+            else:
+                total += 1
+    return total
+
+
+def safe_str(v):
+    return v if isinstance(v, str) and v else None
+
+
+# ------------------------------------------------------------- collection
+# A field is (key, label, segments); a segment is (text, style).
+# style: None | "rainbow" | "dim" | ("gauge", colour-name)
+
+def collect(now=None):
+    now = now or datetime.now(timezone.utc)
+    home = Path(os.environ.get("CLAUDEFETCH_HOME") or Path.home())
+    claude_dir = home / ".claude"
+    cj = read_json(home / ".claude.json")
+    settings = read_json(claude_dir / "settings.json")
+    oauth = cj.get("oauthAccount")
+    oauth = oauth if isinstance(oauth, dict) else {}
+    creds = read_credentials(claude_dir)
+    fields = []
+
+    def add(key, label, *segs):
+        segs = [s for s in segs if s[0]]
+        if segs:
+            fields.append((key, label, list(segs)))
+
+    # Plan
+    plan = safe_str(oauth.get("planDisplayName"))
+    if not plan and creds.get("subscriptionType"):
+        plan = creds["subscriptionType"].title()
+    tier = tier_name(safe_str(oauth.get("organizationRateLimitTier"))
+                     or creds.get("rateLimitTier"))
+    if plan and tier:
+        add("plan", "Plan", (plan, "rainbow"), (" · " + tier, None))
+    elif plan:
+        add("plan", "Plan", (plan, "rainbow"))
+    elif tier:
+        add("plan", "Plan", (tier, None))
+
+    billing = safe_str(oauth.get("billingType"))
+    if billing:
+        add("billing", "Billing", (billing.replace("_", " "), None))
+
+    # Model
+    model = safe_str(os.environ.get("ANTHROPIC_MODEL")) or safe_str(settings.get("model"))
+    if model:
+        pretty = model_name(model)
+        add("model", "Model", (model if pretty == model else "%s (%s)" % (pretty, model), None))
+
+    if safe_str(settings.get("effortLevel")):
+        add("effort", "Effort", (settings["effortLevel"], None))
+
+    # Usage (Claude Code's own cache, no network)
+    cache = cj.get("cachedUsageUtilization")
+    cache = cache if isinstance(cache, dict) else {}
+    util = cache.get("utilization")
+    util = util if isinstance(util, dict) else {}
+    usage = []
+    for key, label, name in (("five_hour", "Usage 5h", "usage_5h"),
+                             ("seven_day", "Usage 7d", "usage_7d")):
+        entry = util.get(key)
+        if not isinstance(entry, dict):
+            continue
+        pct = entry.get("utilization")
+        reset = parse_time(entry.get("resets_at"))
+        if isinstance(pct, bool) or not isinstance(pct, (int, float)) or reset is None:
+            continue
+        left = (reset - now).total_seconds()
+        if left <= 0:
+            continue
+        shown = int(math.floor(pct + 0.5))
+        usage.append([name, label,
+                      [(gauge(pct).rstrip("─"), ("gauge", gauge_color(pct))),
+                       (gauge(pct)[len(gauge(pct).rstrip("─")):], ("gauge", "surface2")),
+                       (" %d%% · resets in %s" % (shown, duration(left)), None)]])
+    fetched = cache.get("fetchedAtMs")
+    if usage and isinstance(fetched, (int, float)) and not isinstance(fetched, bool):
+        usage[-1][2].append(("  " + ago(fetched, now.timestamp()), "dim"))
+        note = ago(fetched, now.timestamp())
+    else:
+        note = None
+    for name, label, segs in usage:
+        fields.append((name, label, segs))
+    # keep the cache note addressable in --json without a visual line of its own
+    cache_note = note
+
+    if isinstance(oauth.get("hasExtraUsageEnabled"), bool):
+        add("extra_usage", "Extra usage", ("on" if oauth["hasExtraUsageEnabled"] else "off", None))
+    if safe_str(oauth.get("organizationRole")):
+        add("role", "Role", (oauth["organizationRole"], None))
+    member = date_with_age(oauth.get("accountCreatedAt"), now)
+    if member:
+        add("member_since", "Member since", (member, None))
+    subscribed = date_with_age(oauth.get("subscriptionCreatedAt"), now)
+    if subscribed:
+        add("subscribed", "Subscribed", (subscribed, None))
+
+    # Claude Code
+    version = claude_version()
+    extra = []
+    if safe_str(cj.get("installMethod")):
+        extra.append(cj["installMethod"])
+    if isinstance(cj.get("autoUpdates"), bool):
+        extra.append("auto-update " + ("on" if cj["autoUpdates"] else "off"))
+    cc = version or ""
+    if extra:
+        cc = (cc + " " if cc else "") + "(" + ", ".join(extra) + ")"
+    add("claude_code", "Claude Code", (cc, None))
+
+    if safe_str(settings.get("outputStyle")):
+        add("output_style", "Output style", (settings["outputStyle"], None))
+    if safe_str(settings.get("theme")):
+        add("theme", "Theme", (settings["theme"], None))
+
+    # Extensions
+    ep = settings.get("enabledPlugins")
+    plugins = sum(1 for v in ep.values() if v is True) if isinstance(ep, dict) else None
+    mcp = cj.get("mcpServers")
+    parts = []
+    for n, word in ((count_glob(claude_dir / "agents", "*.md"), "agents"),
+                    (count_glob(claude_dir / "skills", "*/SKILL.md"), "skills"),
+                    (plugins, "plugins"),
+                    (len(mcp) if isinstance(mcp, dict) else None, "MCP"),
+                    (hook_count(settings.get("hooks")), "hooks")):
+        if n is not None:
+            parts.append("%d %s" % (n, word))
+    add("extensions", "Extensions", (" · ".join(parts), None))
+
+    projects = cj.get("projects")
+    parts = []
+    if isinstance(projects, dict):
+        parts.append("%d projects" % len(projects))
+    sessions = count_glob(claude_dir / "projects", "*/*.jsonl")
+    if sessions is not None:
+        parts.append("%d sessions" % sessions)
+    starts = cj.get("numStartups")
+    if isinstance(starts, int) and not isinstance(starts, bool):
+        parts.append("%d launches" % starts)
+    add("projects", "Local", (" · ".join(parts), None))
+
+    first = parse_time(cj.get("claudeCodeFirstTokenDate"))
+    if first:
+        add("first_token", "First token", (first.strftime("%Y-%m-%d"), None))
+
+    tp = safe_str(os.environ.get("TERM_PROGRAM"))
+    if tp:
+        ver = safe_str(os.environ.get("TERM_PROGRAM_VERSION"))
+        add("terminal", "Terminal", (tp + (" " + ver if ver else ""), None))
+    sh = safe_str(os.environ.get("SHELL"))
+    if sh:
+        add("shell", "Shell", (os.path.basename(sh), None))
+
+    # Title
+    name = safe_str(oauth.get("displayName"))
+    org = safe_str(oauth.get("organizationName"))
+    if org and EMAIL_RE.search(org):
+        org = None  # personal orgs are named after the email address
+    title = None
+    if name and org:
+        title = "%s@%s" % (name, org)
+    elif name:
+        title = name
+    return title, fields, cache_note
+
+
+def scrub(s):
+    if isinstance(s, CustomTitle):
+        return str(s)  # chosen by the user, shown verbatim
+    return UUID_RE.sub("", EMAIL_RE.sub("", s))
+
+
+class CustomTitle(str):
+    """A title the user set themselves; exempt from the email scrub."""
+
+
+def custom_title(flag):
+    """--title > $CLAUDEFETCH_TITLE > ~/.config/claudefetch/title (first line)."""
+    if flag:
+        return CustomTitle(flag)
+    env = os.environ.get("CLAUDEFETCH_TITLE")
+    if env:
+        return CustomTitle(env)
+    home = Path(os.environ.get("CLAUDEFETCH_HOME", Path.home()))
+    try:
+        line = (home / ".config" / "claudefetch" / "title").read_text().splitlines()[0].strip()
+    except (OSError, IndexError, UnicodeDecodeError):
+        return None
+    return CustomTitle(line) if line else None
+
+
+# ------------------------------------------------------------- rendering
+
+def render_value(segs, color, phase):
+    out = []
+    for text, style in segs:
+        text = scrub(text)
+        if not color:
+            out.append(("  " + text.strip()) if style == "dim" else text)
+            continue
+        if style == "rainbow":
+            out.append(rainbow(text, phase))
+        elif style == "dim":
+            out.append(paint(text, "overlay1"))
+        elif isinstance(style, tuple):
+            out.append(paint(text, style[1]))
+        else:
+            out.append(paint(text, "text"))
+    return "".join(out)
+
+
+def info_row(field, color, phase):
+    _, label, segs = field
+    if not color:
+        return "%s: %s" % (label, render_value(segs, False, phase))
+    return paint(label, "blue", bold=True) + paint(": ", "overlay0") + render_value(segs, True, phase)
+
+
+def build_info(title, fields, color):
+    """Returns (rows, plan_index) where rows are callables(phase) -> str."""
+    rows = []
+    plan_idx = None
+    if title:
+        title = scrub(title)  # keeps a CustomTitle as is
+        if color:
+            head = paint(title.split("@", 1)[0], "mauve", True)
+            if "@" in title:
+                head += paint("@", "text") + paint(title.split("@", 1)[1], "mauve", True)
+        else:
+            head = title
+        rows.append(lambda p, h=head: h)
+        under = "-" * len(title)
+        rows.append(lambda p, u=under: paint(u, "text") if color else u)
+    for f in fields:
+        if f[0] == "plan":
+            plan_idx = len(rows)
+        rows.append(lambda p, f=f: info_row(f, color, p))
+    if color:
+        rows.append(lambda p: "")
+        for names in BLOCK_ROWS:
+            rows.append(lambda p, n=names: "".join(paint("███", c) for c in n))
+    return rows, plan_idx
+
+
+def compose(rows, logo, color, phase, only=None):
+    width = max(len(l) for l in LOGO) if logo else 0
+    n = max(len(rows), len(LOGO) if logo else 0)
+    lines = []
+    for i in range(n):
+        if only is not None and i != only:
+            lines.append(None)
+            continue
+        left = ""
+        if logo:
+            raw = LOGO[i] if i < len(LOGO) else ""
+            left = raw.ljust(width)
+            if color:
+                left = (logo_fg(i, len(LOGO)) + left + RESET) if raw.strip() else left
+            left += "   "
+        right = rows[i](phase) if i < len(rows) else ""
+        line = left + right
+        lines.append(line if color else line.rstrip())
+    return lines
+
+
+def to_json(title, fields, cache_note):
+    out = {}
+    if title:
+        out["name"] = scrub(title)
+    for key, _label, segs in fields:
+        out[key] = scrub("".join(t for t, s in segs if s != "dim"))
+    if cache_note:
+        out["usage_cache"] = cache_note
+    return out
+
+
+def animate(rows, plan_idx, logo, seconds, total):
+    up = total - plan_idx
+    out = sys.stdout
+    out.write("\033[?25l")
+    try:
+        frames = int(seconds / 0.05)
+        for f in range(1, frames + 1):
+            line = compose(rows, logo, True, f * 0.08, only=plan_idx)[plan_idx]
+            out.write("\033[%dA\r%s\033[K\033[%dB\r" % (up, line, up))
+            out.flush()
+            time.sleep(0.05)
+        line = compose(rows, logo, True, 0, only=plan_idx)[plan_idx]
+        out.write("\033[%dA\r%s\033[K\033[%dB\r" % (up, line, up))
+        out.flush()
+    finally:
+        out.write("\033[?25h")
+        out.flush()
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="claudefetch",
+                                 description="fastfetch-style summary of your Claude setup")
+    ap.add_argument("--json", action="store_true", help="print fields as JSON")
+    ap.add_argument("--no-color", action="store_true", help="disable colours")
+    ap.add_argument("--no-logo", action="store_true", help="hide the logo")
+    ap.add_argument("--no-anim", action="store_true", help="disable the rainbow animation")
+    ap.add_argument("--anim", type=float, default=2.0, metavar="SECONDS",
+                    help="animation length in seconds (default 2.0, 0 = off)")
+    ap.add_argument("--title", metavar="TEXT",
+                    help="title line (default: $CLAUDEFETCH_TITLE, ~/.config/claudefetch/title, or your display name)")
+    ap.add_argument("--version", action="version", version="claudefetch " + VERSION)
+    args = ap.parse_args(argv)
+
+    try:
+        title, fields, cache_note = collect()
+    except Exception:  # never crash on odd input
+        title, fields, cache_note = None, [], None
+    title = custom_title(args.title) or title
+
+    if args.json:
+        print(json.dumps(to_json(title, fields, cache_note), ensure_ascii=False, indent=2))
+        return 0
+
+    tty = sys.stdout.isatty()
+    color = not args.no_color and not os.environ.get("NO_COLOR") and tty
+    logo = not args.no_logo
+    rows, plan_idx = build_info(title, fields, color)
+    lines = compose(rows, logo, color, 0)
+    top = "\n" if tty else ""  # breathing room under the shell prompt
+    sys.stdout.write(top + "\n".join(lines) + "\n")
+    sys.stdout.flush()
+
+    if (color and tty and plan_idx is not None and not args.no_anim
+            and not os.environ.get("CLAUDEFETCH_NO_ANIM") and args.anim > 0):
+        try:
+            animate(rows, plan_idx, logo, args.anim, len(lines))
+        except KeyboardInterrupt:
+            return 130
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
