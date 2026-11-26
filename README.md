@@ -27,7 +27,35 @@ macOS keychain item `Claude Code-credentials` only `subscriptionType` and
 
 ## Install
 
-    ln -s "$PWD/claudefetch" ~/.local/bin/claudefetch
+Needs Python 3.9+ (the one macOS ships works) and nothing else. It reads the files Claude Code keeps in
+`~/.claude.json` and `~/.claude/`, so sign in to Claude Code first.
+
+One file, straight into `~/.local/bin` (make sure that directory is on your `PATH`):
+
+```bash
+mkdir -p ~/.local/bin
+curl -fsSL https://raw.githubusercontent.com/amornnan19/claudefetch/main/claudefetch -o ~/.local/bin/claudefetch
+chmod +x ~/.local/bin/claudefetch
+claudefetch
+```
+
+Or clone it and link it, so `git pull` updates it:
+
+```bash
+git clone https://github.com/amornnan19/claudefetch.git
+cd claudefetch
+ln -s "$PWD/claudefetch" ~/.local/bin/claudefetch
+```
+
+The title line defaults to your Claude display name. To set your own:
+
+```bash
+mkdir -p ~/.config/claudefetch
+echo 'you@example.dev' > ~/.config/claudefetch/title
+```
+
+Works on macOS and Linux. On macOS the plan and tier also come from the
+keychain item Claude Code writes; on Linux from `~/.claude/.credentials.json`.
 
 ## Tests
 
@@ -42,3 +70,7 @@ screenshots it with `chrome-headless`.
 ```bash
 python3 scripts/render-preview.py
 ```
+
+## License
+
+MIT, see [LICENSE](LICENSE).
